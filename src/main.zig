@@ -8,14 +8,14 @@ const mem = std.mem;
 const ArrayList = std.ArrayList;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
     _ = try parseAiger(allocator, "buffer.aag");
 
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("\nSuccess!", .{});
+    try stdout.print("\nSuccess!\n", .{});
 }
 
 const NodeKind = enum(u2) { andgate, input, constant };
@@ -58,7 +58,6 @@ pub fn readFile(allocator: std.mem.Allocator, filename: []const u8) ![]u8 {
 ///     A = number of AND gates
 pub fn parseAiger(allocator: std.mem.Allocator, filename: []const u8) !Aiger {
     const contents = try readFile(allocator, filename);
-    defer allocator.free(contents);
 
     const stdout = std.io.getStdOut();
     try stdout.writer().print("Contents:\n", .{});
@@ -84,7 +83,7 @@ pub fn parseAiger(allocator: std.mem.Allocator, filename: []const u8) !Aiger {
         }.parse;
 
         break :blk .{
-            .max_index = try parseNextU32(&tokens),
+            .max_var = try parseNextU32(&tokens),
             .inputs = try parseNextU32(&tokens),
             .latches = try parseNextU32(&tokens),
             .outputs = try parseNextU32(&tokens),
@@ -92,7 +91,85 @@ pub fn parseAiger(allocator: std.mem.Allocator, filename: []const u8) !Aiger {
         };
     };
 
-    const aiger = Aiger.init(header.max_index, header.inputs, header.latches, header.outputs, header.andgates, body);
+    var lines = std.mem.tokenizeScalar(u8, body, '\n');
+
+    var inputs = try ArrayList(u32).initCapacity(allocator, header.inputs);
+    errdefer inputs.deinit();
+    for (0..header.inputs) |_| {
+        const input_line = lines.next() orelse return error.UnexpectedEndOfFile;
+        var input_tokens = std.mem.tokenizeScalar(u8, input_line, ' ');
+        const token = input_tokens.next() orelse return error.InvalidFormat;
+        const input = try std.fmt.parseInt(u32, token, 10);
+
+        // Validate - input should be an even, positive integer
+        if (input == 0 or input % 2 != 0) return error.InvalidInputLiteral;
+
+        try inputs.append(input);
+
+        // Check for extra unexpected tokens
+        if (input_tokens.next() != null) return error.ExtraTokensInLine;
+    }
+
+    var latches = try ArrayList(LatchInfo).initCapacity(allocator, header.latches);
+    errdefer latches.deinit();
+    for (0..header.latches) |_| {
+        const latch_line = lines.next() orelse return error.UnexpectedEndOfFile;
+        var latch_tokens = std.mem.tokenizeScalar(u8, latch_line, ' ');
+
+        const curr_state_token = latch_tokens.next() orelse return error.InvalidFormat;
+        const curr_state = try std.fmt.parseInt(u32, curr_state_token, 10);
+        // Validate - current state should be an even, positive integer
+        if (curr_state == 0 or curr_state % 2 != 0) return error.InvalidLatchCurrentState;
+
+        const next_state_token = latch_tokens.next() orelse return error.InvalidFormat;
+        const next_state = try std.fmt.parseInt(u32, next_state_token, 10);
+        // Validate - current state should be an even, positive integer
+        if (next_state == 0) return error.InvalidLatchNextState;
+
+        try latches.append(LatchInfo.init(curr_state, next_state));
+
+        // Check for extra unexpected tokens
+        if (latch_tokens.next() != null) return error.ExtraTokensInLine;
+    }
+
+    var outputs = try ArrayList(u32).initCapacity(allocator, header.outputs);
+    errdefer outputs.deinit();
+    for (0..header.outputs) |_| {
+        const outputs_line = lines.next() orelse return error.UnexpectedEndOfFile;
+        var output_tokens = std.mem.tokenizeScalar(u8, outputs_line, ' ');
+        const token = output_tokens.next() orelse return error.InvalidFormat;
+        const output = try std.fmt.parseInt(u32, token, 10);
+
+        try outputs.append(output);
+
+        // Check for extra unexpected tokens
+        if (output_tokens.next() != null) return error.ExtraTokensInLine;
+    }
+
+    var andgates = try ArrayList(AndGate).initCapacity(allocator, header.andgates);
+    errdefer andgates.deinit();
+    for (0..header.andgates) |_| {
+        const andgate_line = lines.next() orelse return error.UnexpectedEndOfFile;
+        var andgate_tokens = std.mem.tokenizeScalar(u8, andgate_line, ' ');
+
+        const lhs_token = andgate_tokens.next() orelse return error.InvalidFormat;
+        const lhs = try std.fmt.parseInt(u32, lhs_token, 10);
+        // Validate - lhs should be an even, positive integer
+        if (lhs == 0 or lhs % 2 != 0) return error.InvalidAndGateLhs;
+
+        const rhs0_token = andgate_tokens.next() orelse return error.InvalidFormat;
+        const rhs0 = try std.fmt.parseInt(u32, rhs0_token, 10);
+
+        const rhs1_token = andgate_tokens.next() orelse return error.InvalidFormat;
+        const rhs1 = try std.fmt.parseInt(u32, rhs1_token, 10);
+
+        try andgates.append(AndGate.init(lhs, rhs0, rhs1));
+
+        // Check for extra unexpected tokens
+        if (andgate_tokens.next() != null) return error.ExtraTokensInLine;
+    }
+
+    const aiger = Aiger.init(header.max_var, inputs, latches, outputs, andgates, lines.rest());
 
     try stdout.writer().print("Aiger:\n{}", .{aiger});
 
@@ -100,21 +177,52 @@ pub fn parseAiger(allocator: std.mem.Allocator, filename: []const u8) !Aiger {
 }
 
 const Aiger = struct {
-    max_index: u32,
-    inputs: u32,
-    latches: u32,
-    outputs: u32,
-    andgates: u32,
+    max_var: u32,
+    inputs: ArrayList(u32),
+    latches: ArrayList(LatchInfo),
+    outputs: ArrayList(u32),
+    andgates: ArrayList(AndGate),
     body: []const u8,
 
-    pub fn init(max_index: u32, inputs: u32, latches: u32, outputs: u32, andgates: u32, body: []const u8) Aiger {
+    pub fn init(max_var: u32, inputs: ArrayList(u32), latches: ArrayList(LatchInfo), outputs: ArrayList(u32), andgates: ArrayList(AndGate), body: []const u8) Aiger {
         return Aiger{
-            .max_index = max_index,
+            .max_var = max_var,
             .inputs = inputs,
             .latches = latches,
             .outputs = outputs,
             .andgates = andgates,
             .body = body,
+        };
+    }
+
+    pub fn deinit(self: *Aiger) void {
+        self.inputs.deinit();
+        self.latches.deinit();
+        self.outputs.deinit();
+        self.andgates.deinit();
+    }
+};
+
+const LatchInfo = struct {
+    curr_state: u32,
+    next_state: u32,
+
+    pub fn init(curr_state: u32, next_state: u32) LatchInfo {
+        return LatchInfo{
+            .curr_state = curr_state,
+            .next_state = next_state,
+        };
+    }
+};
+
+const AndGate = struct {
+    lhs: u32,
+    rhs: [2]u32,
+
+    pub fn init(lhs: u32, rhs0: u32, rhs1: u32) AndGate {
+        return AndGate{
+            .lhs = lhs,
+            .rhs = [2]u32{ rhs0, rhs1 },
         };
     }
 };
