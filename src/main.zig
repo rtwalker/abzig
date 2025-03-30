@@ -6,13 +6,14 @@ const std = @import("std");
 const assert = std.debug.assert;
 const mem = std.mem;
 const ArrayList = std.ArrayList;
+const AutoHashMap = std.AutoHashMap;
 
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    _ = try parseAiger(allocator, "buffer.aag");
+    _ = try parseAiger(allocator, "halfadder.aag");
 
     const stdout = std.io.getStdOut().writer();
     try stdout.print("\nSuccess!\n", .{});
@@ -45,17 +46,6 @@ pub fn readFile(allocator: std.mem.Allocator, filename: []const u8) ![]u8 {
     return try file.readToEndAlloc(allocator, file_size);
 }
 
-/// An AIGER file in ASCII format starts with the format identifier
-/// string 'aag' for ASCII AIG and 5 non negative integers 'M', 'I',
-/// 'L', 'O', 'A' separated by spaces.
-///
-///   The interpretation of the integers is as follows
-///
-///     M = maximum variable index
-///     I = number of inputs
-///     L = number of latches
-///     O = number of outputs
-///     A = number of AND gates
 pub fn parseAiger(allocator: std.mem.Allocator, filename: []const u8) !Aiger {
     const contents = try readFile(allocator, filename);
 
@@ -152,24 +142,69 @@ pub fn parseAiger(allocator: std.mem.Allocator, filename: []const u8) !Aiger {
         const andgate_line = lines.next() orelse return error.UnexpectedEndOfFile;
         var andgate_tokens = std.mem.tokenizeScalar(u8, andgate_line, ' ');
 
-        const lhs_token = andgate_tokens.next() orelse return error.InvalidFormat;
-        const lhs = try std.fmt.parseInt(u32, lhs_token, 10);
-        // Validate - lhs should be an even, positive integer
-        if (lhs == 0 or lhs % 2 != 0) return error.InvalidAndGateLhs;
+        const output_token = andgate_tokens.next() orelse return error.InvalidFormat;
+        const output = try std.fmt.parseInt(u32, output_token, 10);
+        // Validate - output should be an even, positive integer
+        if (output == 0 or output % 2 != 0) return error.InvalidAndGateOutput;
 
-        const rhs0_token = andgate_tokens.next() orelse return error.InvalidFormat;
-        const rhs0 = try std.fmt.parseInt(u32, rhs0_token, 10);
+        const input0_token = andgate_tokens.next() orelse return error.InvalidFormat;
+        const input0 = try std.fmt.parseInt(u32, input0_token, 10);
 
-        const rhs1_token = andgate_tokens.next() orelse return error.InvalidFormat;
-        const rhs1 = try std.fmt.parseInt(u32, rhs1_token, 10);
+        const input1_token = andgate_tokens.next() orelse return error.InvalidFormat;
+        const input1 = try std.fmt.parseInt(u32, input1_token, 10);
 
-        try andgates.append(AndGate.init(lhs, rhs0, rhs1));
+        try andgates.append(AndGate.init(output, input0, input1));
 
         // Check for extra unexpected tokens
         if (andgate_tokens.next() != null) return error.ExtraTokensInLine;
     }
 
-    const aiger = Aiger.init(header.max_var, inputs, latches, outputs, andgates, lines.rest());
+    var symbols = SymbolTable.init(allocator);
+    defer symbols.deinit();
+    while (lines.peek()) |next_line| {
+        // Check if we've reached the comment section
+        if (next_line.len > 0 and next_line[0] == 'c') {
+            break;
+        }
+
+        // Confirm this is a symbol line
+        if (next_line.len < 2) break;
+        if (std.mem.indexOfAny(u8, "ilo", next_line[0..1]) == null) break;
+
+        _ = lines.next();
+
+        var symbol_tokens = std.mem.splitScalar(u8, next_line, ' ');
+        const type_specifier = symbol_tokens.next() orelse return error.InvalidFormat;
+
+        const symbol_type = type_specifier[0];
+        const position_str = type_specifier[1..];
+        const index = std.fmt.parseInt(u32, position_str, 10) catch continue;
+
+        const name = symbol_tokens.next() orelse continue;
+
+        switch (symbol_type) {
+            'i' => try symbols.input_names.put(index, try allocator.dupe(u8, name)),
+            'l' => try symbols.latch_names.put(index, try allocator.dupe(u8, name)),
+            'o' => try symbols.output_names.put(index, try allocator.dupe(u8, name)),
+            else => return error.InvalidFormat,
+        }
+    }
+
+    var comments: ?[]const u8 = null;
+    errdefer if (comments) |c| allocator.free(c);
+
+    if (lines.peek()) |next_line| {
+        if (next_line.len > 0 and next_line[0] == 'c') {
+            _ = lines.next();
+            var remaining_content: []const u8 = "";
+            if (lines.rest().len > 0) {
+                remaining_content = try allocator.dupe(u8, lines.rest());
+                comments = remaining_content;
+            }
+        }
+    }
+
+    const aiger = Aiger.init(header.max_var, inputs, latches, outputs, andgates, symbols, comments);
 
     try stdout.writer().print("Aiger:\n{}", .{aiger});
 
@@ -182,16 +217,18 @@ const Aiger = struct {
     latches: ArrayList(LatchInfo),
     outputs: ArrayList(u32),
     andgates: ArrayList(AndGate),
-    body: []const u8,
+    symbols: SymbolTable,
+    comments: ?[]const u8,
 
-    pub fn init(max_var: u32, inputs: ArrayList(u32), latches: ArrayList(LatchInfo), outputs: ArrayList(u32), andgates: ArrayList(AndGate), body: []const u8) Aiger {
+    pub fn init(max_var: u32, inputs: ArrayList(u32), latches: ArrayList(LatchInfo), outputs: ArrayList(u32), andgates: ArrayList(AndGate), symbols: SymbolTable, comments: ?[]const u8) Aiger {
         return Aiger{
             .max_var = max_var,
             .inputs = inputs,
             .latches = latches,
             .outputs = outputs,
             .andgates = andgates,
-            .body = body,
+            .symbols = symbols,
+            .comments = comments,
         };
     }
 
@@ -200,6 +237,7 @@ const Aiger = struct {
         self.latches.deinit();
         self.outputs.deinit();
         self.andgates.deinit();
+        self.symbols.deinit();
     }
 };
 
@@ -216,13 +254,49 @@ const LatchInfo = struct {
 };
 
 const AndGate = struct {
-    lhs: u32,
-    rhs: [2]u32,
+    output: u32,
+    inputs: [2]u32,
 
-    pub fn init(lhs: u32, rhs0: u32, rhs1: u32) AndGate {
+    pub fn init(output: u32, input0: u32, input1: u32) AndGate {
         return AndGate{
-            .lhs = lhs,
-            .rhs = [2]u32{ rhs0, rhs1 },
+            .output = output,
+            .inputs = [2]u32{ input0, input1 },
         };
+    }
+};
+
+const SymbolTable = struct {
+    input_names: std.AutoHashMap(u32, []const u8),
+    latch_names: std.AutoHashMap(u32, []const u8),
+    output_names: std.AutoHashMap(u32, []const u8),
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) SymbolTable {
+        return .{
+            .input_names = std.AutoHashMap(u32, []const u8).init(allocator),
+            .latch_names = std.AutoHashMap(u32, []const u8).init(allocator),
+            .output_names = std.AutoHashMap(u32, []const u8).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *SymbolTable) void {
+        var input_it = self.input_names.iterator();
+        while (input_it.next()) |entry| {
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.input_names.deinit();
+
+        var latch_it = self.latch_names.iterator();
+        while (latch_it.next()) |entry| {
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.latch_names.deinit();
+
+        var output_it = self.output_names.iterator();
+        while (output_it.next()) |entry| {
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.output_names.deinit();
     }
 };
