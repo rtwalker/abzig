@@ -1,5 +1,5 @@
 {
-  description = "An empty project that uses Zig.";
+  description = "A port of ABC that uses Zig.";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs";
