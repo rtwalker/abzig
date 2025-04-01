@@ -23,8 +23,31 @@ pub fn main() !void {
     const command = args[1];
 
     if (std.mem.eql(u8, command, "read")) {
-        _ = try Aiger.parseAiger(allocator, args[2]);
+        var aiger = try Aiger.parseAiger(allocator, args[2]);
+        defer aiger.deinit();
+
+        // TODO
+        // var aig = try Aig.fromAiger(allocator, &aiger);
+        // defer aig.deinit();
+
         try stdout.print("\nSuccess!\n", .{});
+    } else if (std.mem.eql(u8, command, "bfs")) {
+        var aiger = try Aiger.parseAiger(allocator, args[2]);
+        defer aiger.deinit();
+
+        // TODO
+        // var aig = try Aig.fromAiger(allocator, &aiger);
+        // defer aig.deinit();
+        //
+        // const Visitor = struct {
+        //     count: u32 = 0,
+        //     pub fn visit(self: *@This(), node: *Aig.Node) !void {
+        //         self.count += 1;
+        //         std.debug.print("Visiting node {d} (level: {d})\n", .{ node.id, node.level });
+        //     }
+        // };
+        // var visitor = Visitor{};
+        // try aig.bfs(&visitor);
     } else if (std.mem.eql(u8, command, "help")) {
         try printUsage(stdout);
     } else {
